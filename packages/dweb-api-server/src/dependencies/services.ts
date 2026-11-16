@@ -42,6 +42,7 @@ import {
   RedisClient,
   TestRedisClient,
   LocallyCachedRedisCacheService,
+  SharedLookupCacheService,
 } from "dweb-api-cache";
 import { TestLoggerService, LoggerService } from "dweb-api-logger";
 import { NameServiceFactory } from "dweb-api-resolver/nameservice";
@@ -103,18 +104,24 @@ export const createApplicationConfigurationBindingsManager = async () => {
 
   const cacheService = new EnvironmentBinding<ICacheService>({
     [EnvironmentConfiguration.Production]: async (env) =>
-      new LocallyCachedRedisCacheService(
+      new SharedLookupCacheService(
         await logger.getBinding(env),
-        await redisClient.getBinding(env),
-        await namedMemoryCacheFactory.getBinding(env),
-        await configuration.getBinding(env),
+        new LocallyCachedRedisCacheService(
+          await logger.getBinding(env),
+          await redisClient.getBinding(env),
+          await namedMemoryCacheFactory.getBinding(env),
+          await configuration.getBinding(env),
+        ),
       ),
     [EnvironmentConfiguration.Development]: async (env) =>
-      new LocallyCachedRedisCacheService(
+      new SharedLookupCacheService(
         await logger.getBinding(env),
-        await redisClient.getBinding(env),
-        await namedMemoryCacheFactory.getBinding(env),
-        await configuration.getBinding(env),
+        new LocallyCachedRedisCacheService(
+          await logger.getBinding(env),
+          await redisClient.getBinding(env),
+          await namedMemoryCacheFactory.getBinding(env),
+          await configuration.getBinding(env),
+        ),
       ),
   });
 

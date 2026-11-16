@@ -8,6 +8,7 @@ import {
   AbstractRedisClient,
   LocallyCachedRedisCacheService,
   MemoryCacheFactory,
+  SharedLookupCacheService,
   TestLaggyRedisClientProxy,
   TestRedisClient,
 } from "dweb-api-cache";
@@ -69,13 +70,13 @@ const flush = () => new Promise((r) => setImmediate(r));
 
 describe("InflightLookups", function () {
   it("runs one lookup for concurrent callers of the same key", async function () {
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     const pending = deferred<{ codec: string }>();
     const lookup = scriptedLookup(() => pending.promise);
 
-    const first = inflight.run("vitalik.eth", "req-1", lookup);
+    const first = inflight.run("vitalik.eth", lookup);
     const others = ["req-2", "req-3", "req-4"].map((id) =>
-      inflight.run("vitalik.eth", id, lookup),
+      inflight.run("vitalik.eth", lookup),
     );
     const original = { codec: "ipfs://bafy" };
     pending.resolve(original);
@@ -91,7 +92,7 @@ describe("InflightLookups", function () {
   });
 
   it("keeps different keys apart", async function () {
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     const seen: string[] = [];
     const lookup = (name: string) => async () => {
       seen.push(name);
@@ -99,8 +100,8 @@ describe("InflightLookups", function () {
     };
 
     const [a, b] = await Promise.all([
-      inflight.run("a.eth", "req-1", lookup("a.eth")),
-      inflight.run("b.eth", "req-2", lookup("b.eth")),
+      inflight.run("a.eth", lookup("a.eth")),
+      inflight.run("b.eth", lookup("b.eth")),
     ]);
 
     expect([a, b]).to.deep.equal(["a.eth", "b.eth"]);
@@ -108,16 +109,16 @@ describe("InflightLookups", function () {
   });
 
   it("lets the ones that joined a failed lookup try once more, together", async function () {
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     const first = deferred<string>();
     const lookup = scriptedLookup(
       () => first.promise,
       async () => "bafy",
     );
 
-    const started = settle(inflight.run("flaky.eth", "req-1", lookup));
+    const started = settle(inflight.run("flaky.eth", lookup));
     const joined = ["req-2", "req-3", "req-4"].map((id) =>
-      settle(inflight.run("flaky.eth", id, lookup)),
+      settle(inflight.run("flaky.eth", lookup)),
     );
     first.reject(new Error("connection reset"));
 
@@ -138,15 +139,15 @@ describe("InflightLookups", function () {
   it("retries with the lookup of the first caller that joined", async function () {
     // matters for the logs: the retry runs with that request's context,
     // not with the one of the request whose attempt failed
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     const failed = failsAtOnce("connection reset");
     const second = scriptedLookup(async () => "from req-2");
     const third = scriptedLookup(async () => "from req-3");
 
     const results = await Promise.all([
-      settle(inflight.run("flaky.eth", "req-1", failed)),
-      settle(inflight.run("flaky.eth", "req-2", second)),
-      settle(inflight.run("flaky.eth", "req-3", third)),
+      settle(inflight.run("flaky.eth", failed)),
+      settle(inflight.run("flaky.eth", second)),
+      settle(inflight.run("flaky.eth", third)),
     ]);
 
     expect(results.map((r) => r.ok)).to.deep.equal([false, true, true]);
@@ -157,12 +158,12 @@ describe("InflightLookups", function () {
   });
 
   it("gives everyone the error when the retry fails too", async function () {
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     const lookup = failsAtOnce("rpc is down");
 
     const results = await Promise.all(
       ["req-1", "req-2", "req-3", "req-4"].map((id) =>
-        settle(inflight.run("down.eth", id, lookup)),
+        settle(inflight.run("down.eth", lookup)),
       ),
     );
 
@@ -176,18 +177,16 @@ describe("InflightLookups", function () {
     expect(inflight.size).to.equal(0);
 
     // nothing is kept, the next caller starts over
-    expect(
-      await inflight.run("down.eth", "req-5", async () => "back"),
-    ).to.equal("back");
+    expect(await inflight.run("down.eth", async () => "back")).to.equal("back");
   });
 
   it("keeps a backend that is down at two lookups per burst of requests", async function () {
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     const lookup = failsAtOnce("connection refused");
     const burst = () =>
       Promise.all(
         Array.from({ length: 20 }, (_, i) =>
-          settle(inflight.run("down.eth", `req-${i}`, lookup)),
+          settle(inflight.run("down.eth", lookup)),
         ),
       );
 
@@ -199,7 +198,7 @@ describe("InflightLookups", function () {
 
   it("doesn't retry a lookup that failed after maxJoinMs", async function () {
     let now = 0;
-    const inflight = new InflightLookups(5000, () => now);
+    const inflight = new InflightLookups(5000, structuredClone, () => now);
     const timingOut = deferred<string>();
     const lookup = scriptedLookup(
       () => timingOut.promise,
@@ -207,7 +206,7 @@ describe("InflightLookups", function () {
     );
 
     const results = ["req-1", "req-2", "req-3"].map((id) =>
-      settle(inflight.run("timeout.eth", id, lookup)),
+      settle(inflight.run("timeout.eth", lookup)),
     );
     now = 5000;
     timingOut.reject(new Error("timeout"));
@@ -220,28 +219,28 @@ describe("InflightLookups", function () {
   });
 
   it("only shares a lookup while it runs", async function () {
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     let lookups = 0;
     const lookup = async () => ++lookups;
 
-    expect(await inflight.run("x.eth", "req-1", lookup)).to.equal(1);
-    expect(await inflight.run("x.eth", "req-2", lookup)).to.equal(2);
+    expect(await inflight.run("x.eth", lookup)).to.equal(1);
+    expect(await inflight.run("x.eth", lookup)).to.equal(2);
   });
 
   it("doesn't join a lookup older than maxJoinMs", async function () {
     let now = 0;
-    const inflight = new InflightLookups(5000, () => now);
+    const inflight = new InflightLookups(5000, structuredClone, () => now);
     const stuck = deferred<string>();
     const notCalled = async () => "not called";
 
-    const first = inflight.run("slow.eth", "req-1", () => stuck.promise);
+    const first = inflight.run("slow.eth", () => stuck.promise);
     now = 4999;
-    const joined = inflight.run("slow.eth", "req-2", notCalled);
+    const joined = inflight.run("slow.eth", notCalled);
     now = 5000;
     const fresh = deferred<string>();
-    const second = inflight.run("slow.eth", "req-3", () => fresh.promise);
+    const second = inflight.run("slow.eth", () => fresh.promise);
     now = 5001;
-    const joinedSecond = inflight.run("slow.eth", "req-4", notCalled);
+    const joinedSecond = inflight.run("slow.eth", notCalled);
 
     // the old lookup finishing must not drop the newer one from the map
     stuck.resolve("old");
@@ -256,9 +255,9 @@ describe("InflightLookups", function () {
   });
 
   it("handles a lookup that throws before returning a promise", async function () {
-    const inflight = new InflightLookups(5000);
+    const inflight = new InflightLookups(5000, structuredClone);
     const result = await settle(
-      inflight.run("sync.eth", "req-1", () => {
+      inflight.run("sync.eth", () => {
         throw new Error("bad input");
       }),
     );
@@ -267,21 +266,21 @@ describe("InflightLookups", function () {
     expect(inflight.size).to.equal(0);
   });
 
-  it("says who started the lookup a caller would join", async function () {
+  it("tells whether a caller would join a running lookup", async function () {
     let now = 0;
-    const inflight = new InflightLookups(5000, () => now);
+    const inflight = new InflightLookups(5000, structuredClone, () => now);
     const pending = deferred<string>();
 
-    expect(inflight.joinable("k.eth")).to.equal(undefined);
-    const running = inflight.run("k.eth", "req-1", () => pending.promise);
-    expect(inflight.joinable("k.eth")).to.deep.equal({ startedBy: "req-1" });
+    expect(inflight.joinable("k.eth")).to.equal(false);
+    const running = inflight.run("k.eth", () => pending.promise);
+    expect(inflight.joinable("k.eth")).to.equal(true);
     now = 5000;
-    expect(inflight.joinable("k.eth")).to.equal(undefined);
+    expect(inflight.joinable("k.eth")).to.equal(false);
 
     pending.resolve("bafy");
     await running;
     now = 0;
-    expect(inflight.joinable("k.eth")).to.equal(undefined);
+    expect(inflight.joinable("k.eth")).to.equal(false);
   });
 
   it("leaves no unhandled rejections behind", async function () {
@@ -289,18 +288,16 @@ describe("InflightLookups", function () {
     const onUnhandled = (reason: unknown) => unhandled.push(reason);
     process.on("unhandledRejection", onUnhandled);
     try {
-      const inflight = new InflightLookups(5000);
+      const inflight = new InflightLookups(5000, structuredClone);
       // alone, with joiners and a failing retry, and a synchronous throw;
       // every caller handles its own promise, nothing else may be left
-      await settle(inflight.run("a.eth", "r1", failsAtOnce("down")));
+      await settle(inflight.run("a.eth", failsAtOnce("down")));
       const lookup = failsAtOnce("down");
       await Promise.all(
-        ["r1", "r2", "r3"].map((id) =>
-          settle(inflight.run("b.eth", id, lookup)),
-        ),
+        ["r1", "r2", "r3"].map((id) => settle(inflight.run("b.eth", lookup))),
       );
       await settle(
-        inflight.run("c.eth", "r1", () => {
+        inflight.run("c.eth", () => {
           throw new Error("sync");
         }),
       );
@@ -450,19 +447,22 @@ describe("cache memoize with concurrent misses", function () {
     class SharedRedis extends AbstractRedisClient {}
     const redisMock = new RedisMock();
     await redisMock.flushall();
-    // ioredis-mock instances share their data, like processes on one redis
+    // each process gets its own memory cache and coalescing, redis is shared
     const newProcess = () => {
       const memory = new MemoryCacheFactory();
-      return new LocallyCachedRedisCacheService(
+      return new SharedLookupCacheService(
         quietLogger,
-        new SharedRedis(new RedisMock(), configuration),
-        (name) =>
-          memory.createNamedMemoryCacheFactory(
-            name,
-            quietLogger,
-            configuration,
-          ),
-        configuration,
+        new LocallyCachedRedisCacheService(
+          quietLogger,
+          new SharedRedis(redisMock, configuration),
+          (name) =>
+            memory.createNamedMemoryCacheFactory(
+              name,
+              quietLogger,
+              configuration,
+            ),
+          configuration,
+        ),
       );
     };
     const pending = deferred<string>();
@@ -494,7 +494,7 @@ describe("cache memoize with concurrent misses", function () {
     expect(lookup.calls).to.equal(2);
   });
 
-  it("logs which request a waiting request is tied to", async function () {
+  it("logs when a request waits for a running lookup", async function () {
     const services = await createApplicationConfigurationBindingsManager();
     const configuration = await services.configuration.getBinding(env);
     const debugLines: Array<{ message: string; context: unknown }> = [];
@@ -504,12 +504,15 @@ describe("cache memoize with concurrent misses", function () {
         debugLines.push({ message, context: meta.context }),
     } as unknown as ILoggerService;
     const memory = new MemoryCacheFactory();
-    const cache = new LocallyCachedRedisCacheService(
+    const cache = new SharedLookupCacheService(
       logger,
-      await services.redisClient.getBinding(env),
-      (name) =>
-        memory.createNamedMemoryCacheFactory(name, logger, configuration),
-      configuration,
+      new LocallyCachedRedisCacheService(
+        logger,
+        await services.redisClient.getBinding(env),
+        (name) =>
+          memory.createNamedMemoryCacheFactory(name, logger, configuration),
+        configuration,
+      ),
     );
     const pending = deferred<string>();
     const lookup = () => pending.promise;
@@ -528,18 +531,16 @@ describe("cache memoize with concurrent misses", function () {
       "test",
       "traced.eth",
     );
-    // memoize awaits the memory cache before it joins, let that happen
-    await flush();
     pending.resolve("bafy");
     await Promise.all([first, second]);
 
     const waiting = debugLines.filter(
-      (l) => l.message === "waiting for a lookup another request started",
+      (l) => l.message === "waiting for a lookup that is already running",
     );
     expect(waiting).to.deep.equal([
       {
-        message: "waiting for a lookup another request started",
-        context: { key: "test/traced.eth", startedBy: "first" },
+        message: "waiting for a lookup that is already running",
+        context: { key: "test/traced.eth" },
       },
     ]);
   });

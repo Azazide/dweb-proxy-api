@@ -1,52 +1,45 @@
 type RunningLookup = {
   promise: Promise<unknown>;
   startedAt: number;
-  // whoever started it, the trace id for requests
-  startedBy: string;
 };
 
 /**
  * Lets callers that ask for the same key at the same time share one lookup.
  *
- * Without this, every request that misses the cache starts its own lookup,
- * so a name that isn't cached yet (or whose entry just expired) costs one
- * rpc round trip per concurrent request instead of one in total.
- *
  * The first caller runs the lookup and gets its result as is. Callers that
- * join get their own copy, the same as a hit in the memory cache, which
- * clones on get.
+ * join get the result passed through copyForJoiner, so they don't all hold
+ * the same object. What a copy means depends on the values, so the owner
+ * decides.
  *
- * If the lookup fails, the caller that started it gets the error, like
- * before. The ones that joined try once more, together: one more lookup in
- * total, not one each. Without sharing every request had its own attempt,
- * so a single failed attempt (a dropped connection, one bad response) only
- * failed the request that made it, and it shouldn't take everyone who
- * happened to join down with it. If the second attempt fails too, the
- * backend is most likely down and they all get that error. There's no
- * second attempt after a lookup that failed slowly (see below).
+ * If the lookup fails, the caller that started it gets the error. The ones
+ * that joined try once more, together: one more lookup in total, not one
+ * each. On their own each of them would have made its own attempt, so one
+ * failed attempt (a dropped connection, one bad response) shouldn't fail
+ * everyone who happened to join it. If the second attempt fails too, they
+ * all get that error. There's no second attempt after a lookup that failed
+ * slowly (see below).
  *
  * A lookup older than maxJoinMs isn't joined anymore, the next caller starts
  * a new one. A normal lookup is done long before that, so one that is still
- * running is probably stuck on a slow backend, and requests arriving later
- * shouldn't all wait on it.
+ * running is probably stuck, and callers arriving later shouldn't all wait
+ * on it.
  */
 export class InflightLookups {
   private readonly running = new Map<string, RunningLookup>();
 
   constructor(
     private readonly maxJoinMs: number,
+    private readonly copyForJoiner: <T>(value: T) => T,
     private readonly now: () => number = Date.now,
   ) {}
 
-  // Who started the lookup that run(key) would join, undefined if run(key)
-  // would start a new one.
-  joinable(key: string): { startedBy: string } | undefined {
-    const running = this.joinableLookup(key);
-    return running && { startedBy: running.startedBy };
+  // Whether run(key) would join a lookup that is already running.
+  joinable(key: string): boolean {
+    return this.joinableLookup(key) !== undefined;
   }
 
-  run<T>(key: string, startedBy: string, lookup: () => Promise<T>): Promise<T> {
-    return this.runOrJoin(key, startedBy, lookup, true);
+  run<T>(key: string, lookup: () => Promise<T>): Promise<T> {
+    return this.runOrJoin(key, lookup, true);
   }
 
   get size(): number {
@@ -55,23 +48,20 @@ export class InflightLookups {
 
   private runOrJoin<T>(
     key: string,
-    startedBy: string,
     lookup: () => Promise<T>,
     retryIfItFails: boolean,
   ): Promise<T> {
     const running = this.joinableLookup(key);
     if (!running) {
-      return this.start(key, startedBy, lookup);
+      return this.start(key, lookup);
     }
 
     return running.promise.then(
-      // Whatever gets cached has to survive the JSON round trip through
-      // redis, so it's plain data, which structuredClone handles.
-      (value) => structuredClone(value) as T,
+      (value) => this.copyForJoiner(value as T),
       (error) => {
         // A failure that came back quickly is worth one more try. One that
         // took maxJoinMs or longer was most likely a timeout, and another
-        // attempt would only double how long these requests take to fail.
+        // attempt would only double how long these callers take to fail.
         if (
           !retryIfItFails ||
           this.now() - running.startedAt >= this.maxJoinMs
@@ -83,24 +73,16 @@ export class InflightLookups {
         // start() has usually dropped the failed one already, its callback
         // was registered first, but this shouldn't depend on that order.
         this.forget(key, running);
-        return this.runOrJoin(key, startedBy, lookup, false);
+        return this.runOrJoin(key, lookup, false);
       },
     );
   }
 
-  private start<T>(
-    key: string,
-    startedBy: string,
-    lookup: () => Promise<T>,
-  ): Promise<T> {
+  private start<T>(key: string, lookup: () => Promise<T>): Promise<T> {
     // async wrapper so a lookup that throws synchronously still ends up as
     // a rejected promise and gets removed below
     const promise = (async () => lookup())();
-    const entry: RunningLookup = {
-      promise,
-      startedAt: this.now(),
-      startedBy,
-    };
+    const entry: RunningLookup = { promise, startedAt: this.now() };
     this.running.set(key, entry);
 
     const forget = () => this.forget(key, entry);

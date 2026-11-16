@@ -26,9 +26,7 @@ export class SharedLookupCacheService implements ICacheService {
     private readonly inner: ICacheService,
     maxJoinMs = 5000,
   ) {
-    // Memoized values pass a zod schema and are stored in redis as JSON, so
-    // they're plain data and structuredClone can copy them.
-    this.lookups = new InflightLookups(maxJoinMs, structuredClone);
+    this.lookups = new InflightLookups(maxJoinMs);
   }
 
   public memoize<RT>(
@@ -38,16 +36,19 @@ export class SharedLookupCacheService implements ICacheService {
     dbPrefix: string,
     key: string,
   ): Promise<Awaited<RT>> {
-    const cKey = `${dbPrefix}/${key}`;
-    if (this.lookups.joinable(cKey)) {
+    // Only identifies the lookup here, it isn't the wrapped cache's key.
+    const lookupKey = JSON.stringify([dbPrefix, key]);
+    if (this.lookups.joinable(lookupKey)) {
       this.logger.debug("waiting for a lookup that is already running", {
         ...request,
         origin: "SharedLookupCacheService",
-        context: { key: cKey },
+        context: { dbPrefix, key },
       });
     }
-    return this.lookups.run(cKey, () =>
-      this.inner.memoize(request, fThunk, schema, dbPrefix, key),
+    return this.lookups.run(
+      lookupKey,
+      () => this.inner.memoize(request, fThunk, schema, dbPrefix, key),
+      (value) => copyThroughSchema(schema, value),
     );
   }
 
@@ -58,4 +59,14 @@ export class SharedLookupCacheService implements ICacheService {
   ): Promise<number | undefined> {
     return this.inner.getTtl(request, dbPrefix, key);
   }
+}
+
+// Parsing builds new objects and arrays for everything the schema describes,
+// so a caller that joined gets its own copy without us assuming anything
+// about how the wrapped cache stores values. A value the schema doesn't
+// accept is passed on as is, the same as the caller that started the lookup
+// gets it.
+function copyThroughSchema<RT>(schema: ZodType<RT>, value: Awaited<RT>) {
+  const parsed = schema.safeParse(value);
+  return parsed.success ? (parsed.data as Awaited<RT>) : value;
 }

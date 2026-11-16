@@ -6,10 +6,10 @@ type RunningLookup = {
 /**
  * Lets callers that ask for the same key at the same time share one lookup.
  *
- * The first caller runs the lookup and gets its result as is. Callers that
- * join get the result passed through copyForJoiner, so they don't all hold
- * the same object. What a copy means depends on the values, so the owner
- * decides.
+ * The first caller runs the lookup and gets its result as is. A caller that
+ * joins gets the result passed through its own copyForJoiner, so they don't
+ * all hold the same object. What a copy means depends on the values, so the
+ * caller decides; without one, joiners get the same value.
  *
  * If the lookup fails, the caller that started it gets the error. The ones
  * that joined try once more, together: one more lookup in total, not one
@@ -29,7 +29,6 @@ export class InflightLookups {
 
   constructor(
     private readonly maxJoinMs: number,
-    private readonly copyForJoiner: <T>(value: T) => T,
     private readonly now: () => number = Date.now,
   ) {}
 
@@ -38,8 +37,12 @@ export class InflightLookups {
     return this.joinableLookup(key) !== undefined;
   }
 
-  run<T>(key: string, lookup: () => Promise<T>): Promise<T> {
-    return this.runOrJoin(key, lookup, true);
+  run<T>(
+    key: string,
+    lookup: () => Promise<T>,
+    copyForJoiner: (value: T) => T = (value) => value,
+  ): Promise<T> {
+    return this.runOrJoin(key, lookup, copyForJoiner, true);
   }
 
   get size(): number {
@@ -49,6 +52,7 @@ export class InflightLookups {
   private runOrJoin<T>(
     key: string,
     lookup: () => Promise<T>,
+    copyForJoiner: (value: T) => T,
     retryIfItFails: boolean,
   ): Promise<T> {
     const running = this.joinableLookup(key);
@@ -57,7 +61,7 @@ export class InflightLookups {
     }
 
     return running.promise.then(
-      (value) => this.copyForJoiner(value as T),
+      (value) => copyForJoiner(value as T),
       (error) => {
         // A failure that came back quickly is worth one more try. One that
         // took maxJoinMs or longer was most likely a timeout, and another
@@ -73,7 +77,7 @@ export class InflightLookups {
         // start() has usually dropped the failed one already, its callback
         // was registered first, but this shouldn't depend on that order.
         this.forget(key, running);
-        return this.runOrJoin(key, lookup, false);
+        return this.runOrJoin(key, lookup, copyForJoiner, false);
       },
     );
   }

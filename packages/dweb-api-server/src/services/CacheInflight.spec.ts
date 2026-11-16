@@ -70,13 +70,13 @@ const flush = () => new Promise((r) => setImmediate(r));
 
 describe("InflightLookups", function () {
   it("runs one lookup for concurrent callers of the same key", async function () {
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     const pending = deferred<{ codec: string }>();
     const lookup = scriptedLookup(() => pending.promise);
 
-    const first = inflight.run("vitalik.eth", lookup);
-    const others = ["req-2", "req-3", "req-4"].map((id) =>
-      inflight.run("vitalik.eth", lookup),
+    const first = inflight.run("vitalik.eth", lookup, structuredClone);
+    const others = Array.from({ length: 3 }, () =>
+      inflight.run("vitalik.eth", lookup, structuredClone),
     );
     const original = { codec: "ipfs://bafy" };
     pending.resolve(original);
@@ -92,7 +92,7 @@ describe("InflightLookups", function () {
   });
 
   it("keeps different keys apart", async function () {
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     const seen: string[] = [];
     const lookup = (name: string) => async () => {
       seen.push(name);
@@ -109,7 +109,7 @@ describe("InflightLookups", function () {
   });
 
   it("lets the ones that joined a failed lookup try once more, together", async function () {
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     const first = deferred<string>();
     const lookup = scriptedLookup(
       () => first.promise,
@@ -117,7 +117,7 @@ describe("InflightLookups", function () {
     );
 
     const started = settle(inflight.run("flaky.eth", lookup));
-    const joined = ["req-2", "req-3", "req-4"].map((id) =>
+    const joined = Array.from({ length: 3 }, () =>
       settle(inflight.run("flaky.eth", lookup)),
     );
     first.reject(new Error("connection reset"));
@@ -139,7 +139,7 @@ describe("InflightLookups", function () {
   it("retries with the lookup of the first caller that joined", async function () {
     // matters for the logs: the retry runs with that request's context,
     // not with the one of the request whose attempt failed
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     const failed = failsAtOnce("connection reset");
     const second = scriptedLookup(async () => "from req-2");
     const third = scriptedLookup(async () => "from req-3");
@@ -158,13 +158,11 @@ describe("InflightLookups", function () {
   });
 
   it("gives everyone the error when the retry fails too", async function () {
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     const lookup = failsAtOnce("rpc is down");
 
     const results = await Promise.all(
-      ["req-1", "req-2", "req-3", "req-4"].map((id) =>
-        settle(inflight.run("down.eth", lookup)),
-      ),
+      Array.from({ length: 4 }, () => settle(inflight.run("down.eth", lookup))),
     );
 
     for (const result of results) {
@@ -181,7 +179,7 @@ describe("InflightLookups", function () {
   });
 
   it("keeps a backend that is down at two lookups per burst of requests", async function () {
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     const lookup = failsAtOnce("connection refused");
     const burst = () =>
       Promise.all(
@@ -198,14 +196,14 @@ describe("InflightLookups", function () {
 
   it("doesn't retry a lookup that failed after maxJoinMs", async function () {
     let now = 0;
-    const inflight = new InflightLookups(5000, structuredClone, () => now);
+    const inflight = new InflightLookups(5000, () => now);
     const timingOut = deferred<string>();
     const lookup = scriptedLookup(
       () => timingOut.promise,
       async () => "bafy",
     );
 
-    const results = ["req-1", "req-2", "req-3"].map((id) =>
+    const results = Array.from({ length: 3 }, () =>
       settle(inflight.run("timeout.eth", lookup)),
     );
     now = 5000;
@@ -219,7 +217,7 @@ describe("InflightLookups", function () {
   });
 
   it("only shares a lookup while it runs", async function () {
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     let lookups = 0;
     const lookup = async () => ++lookups;
 
@@ -229,7 +227,7 @@ describe("InflightLookups", function () {
 
   it("doesn't join a lookup older than maxJoinMs", async function () {
     let now = 0;
-    const inflight = new InflightLookups(5000, structuredClone, () => now);
+    const inflight = new InflightLookups(5000, () => now);
     const stuck = deferred<string>();
     const notCalled = async () => "not called";
 
@@ -255,7 +253,7 @@ describe("InflightLookups", function () {
   });
 
   it("handles a lookup that throws before returning a promise", async function () {
-    const inflight = new InflightLookups(5000, structuredClone);
+    const inflight = new InflightLookups(5000);
     const result = await settle(
       inflight.run("sync.eth", () => {
         throw new Error("bad input");
@@ -268,7 +266,7 @@ describe("InflightLookups", function () {
 
   it("tells whether a caller would join a running lookup", async function () {
     let now = 0;
-    const inflight = new InflightLookups(5000, structuredClone, () => now);
+    const inflight = new InflightLookups(5000, () => now);
     const pending = deferred<string>();
 
     expect(inflight.joinable("k.eth")).to.equal(false);
@@ -288,13 +286,13 @@ describe("InflightLookups", function () {
     const onUnhandled = (reason: unknown) => unhandled.push(reason);
     process.on("unhandledRejection", onUnhandled);
     try {
-      const inflight = new InflightLookups(5000, structuredClone);
+      const inflight = new InflightLookups(5000);
       // alone, with joiners and a failing retry, and a synchronous throw;
       // every caller handles its own promise, nothing else may be left
       await settle(inflight.run("a.eth", failsAtOnce("down")));
       const lookup = failsAtOnce("down");
       await Promise.all(
-        ["r1", "r2", "r3"].map((id) => settle(inflight.run("b.eth", lookup))),
+        Array.from({ length: 3 }, () => settle(inflight.run("b.eth", lookup))),
       );
       await settle(
         inflight.run("c.eth", () => {
@@ -494,6 +492,62 @@ describe("cache memoize with concurrent misses", function () {
     expect(lookup.calls).to.equal(2);
   });
 
+  it("gives the requests that joined their own copy of the value", async function () {
+    const services = await createApplicationConfigurationBindingsManager();
+    const cache = await services.cacheService.getBinding(env);
+    const schema = z.object({ codec: z.string(), tags: z.array(z.string()) });
+    const pending = deferred<z.infer<typeof schema>>();
+    const lookup = scriptedLookup(() => pending.promise);
+
+    const [first, second, third] = Array.from({ length: 3 }, () =>
+      cache.memoize(request, lookup, schema, "test", "copies.eth"),
+    );
+    const original = { codec: "ipfs", tags: ["a"] };
+    pending.resolve(original);
+
+    const [a, b, c] = await Promise.all([first, second, third]);
+    expect(a).to.equal(original);
+    for (const joined of [b, c]) {
+      expect(joined).to.deep.equal(original);
+      expect(joined).to.not.equal(original);
+      expect(joined.tags).to.not.equal(original.tags);
+    }
+    expect(b).to.not.equal(c);
+    expect(lookup.calls).to.equal(1);
+  });
+
+  it("passes a value the schema rejects on as is instead of failing", async function () {
+    const services = await createApplicationConfigurationBindingsManager();
+    const cache = await services.cacheService.getBinding(env);
+    const pending = deferred<string>();
+    const lookup = scriptedLookup(() => pending.promise);
+
+    const results = Array.from({ length: 3 }, () =>
+      cache.memoize(request, lookup, z.string(), "test", "odd.eth"),
+    );
+    pending.resolve(42 as unknown as string);
+
+    expect(await Promise.all(results)).to.deep.equal([42, 42, 42]);
+    expect(lookup.calls).to.equal(1);
+  });
+
+  it("doesn't share lookups between prefix and key pairs that join the same", async function () {
+    const services = await createApplicationConfigurationBindingsManager();
+    const cache = await services.cacheService.getBinding(env);
+    const one = deferred<string>();
+    const other = deferred<string>();
+    const first = scriptedLookup(() => one.promise);
+    const second = scriptedLookup(() => other.promise);
+
+    const a = cache.memoize(request, first, z.string(), "x/y", "z.eth");
+    const b = cache.memoize(request, second, z.string(), "x", "y/z.eth");
+    one.resolve("from x/y");
+    other.resolve("from x");
+
+    expect([await a, await b]).to.deep.equal(["from x/y", "from x"]);
+    expect([first.calls, second.calls]).to.deep.equal([1, 1]);
+  });
+
   it("logs when a request waits for a running lookup", async function () {
     const services = await createApplicationConfigurationBindingsManager();
     const configuration = await services.configuration.getBinding(env);
@@ -540,7 +594,7 @@ describe("cache memoize with concurrent misses", function () {
     expect(waiting).to.deep.equal([
       {
         message: "waiting for a lookup that is already running",
-        context: { key: "test/traced.eth" },
+        context: { dbPrefix: "test", key: "traced.eth" },
       },
     ]);
   });
